@@ -86,6 +86,9 @@ def train_one_step(
     boxes = batch["boxes"].to(device, non_blocking=True)
     labels = batch["label"].to(device, non_blocking=True)
 
+    if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+        torch.compiler.cudagraph_mark_step_begin()
+
     use_amp = (device.type == "cuda") and (amp_dtype in (torch.bfloat16, torch.float16))
     with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
         outputs = model(frames=frames, boxes=boxes)
@@ -180,6 +183,8 @@ def evaluate(
         boxes = batch["boxes"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
+        if hasattr(torch, "compiler") and hasattr(torch.compiler, "cudagraph_mark_step_begin"):
+            torch.compiler.cudagraph_mark_step_begin()
         with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             outputs = model(frames=frames, boxes=boxes)
             loss = criterion(outputs["logits"], labels)

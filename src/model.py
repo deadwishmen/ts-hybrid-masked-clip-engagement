@@ -238,7 +238,6 @@ class TSHybridMaskedTransformer(nn.Module):
         self.pre_layernorm = pre_layernorm
         self.layers = encoder_layers
         self.use_hf_layers = use_hf_layers
-        self._mask_cache: Dict[Tuple[int, torch.dtype, torch.device], torch.Tensor] = {}
 
         for param in self.pre_layernorm.parameters():
             param.requires_grad = False
@@ -260,19 +259,10 @@ class TSHybridMaskedTransformer(nn.Module):
                 layer.q_proj = LoRALinear(layer.q_proj, r=r, alpha=alpha, dropout=dropout)
                 layer.v_proj = LoRALinear(layer.v_proj, r=r, alpha=alpha, dropout=dropout)
 
-    def _get_cached_additive_mask(
-        self, allowed_mask: torch.Tensor, target_dtype: torch.dtype
-    ) -> torch.Tensor:
-        key = (allowed_mask.shape[0], target_dtype, allowed_mask.device)
-        if key not in self._mask_cache:
-            self._mask_cache[key] = boolean_to_additive_attention_mask(
-                allowed_mask, dtype=target_dtype
-            )
-        return self._mask_cache[key]
-
-    def forward(self, sequence: torch.Tensor, allowed_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, sequence: torch.Tensor, additive_mask: torch.Tensor) -> torch.Tensor:
         hidden_states = self.pre_layernorm(sequence)
-        additive_mask = self._get_cached_additive_mask(allowed_mask, hidden_states.dtype)
+        if additive_mask.dtype != hidden_states.dtype:
+            additive_mask = additive_mask.to(dtype=hidden_states.dtype)
 
         if self.use_hf_layers:
             batch_size = hidden_states.shape[0]
@@ -298,7 +288,7 @@ class EngagementHead(nn.Module):
         self,
         embed_dim: int = 768,
         hidden_dim: int = 384,
-        num_classes: int = 3,
+        num_classes: int = 4,
         dropout: float = 0.2,
     ) -> None:
         super().__init__()
@@ -329,7 +319,7 @@ class StudentEngagementTSHybridCLIP(nn.Module):
         embed_dim: int = 768,
         num_layers: int = 12,
         num_heads: int = 12,
-        num_classes: int = 3,
+        num_classes: int = 4,
         lora_r: int = 8,
         lora_alpha: float = 16.0,
         lora_dropout: float = 0.05,
@@ -371,10 +361,11 @@ class StudentEngagementTSHybridCLIP(nn.Module):
             lora_alpha=lora_alpha,
             lora_dropout=lora_dropout,
         )
-        self.register_buffer(
-            "hybrid_attention_mask",
-            build_ts_hybrid_attention_mask(num_frames=num_frames, num_patches=self.num_patches),
-        )
+        base_mask = build_ts_hybrid_attention_mask(num_frames=num_frames, num_patches=self.num_patches)
+        self.register_buffer("hybrid_attention_mask", base_mask)
+        self.register_buffer("additive_mask_fp32", boolean_to_additive_attention_mask(base_mask, torch.float32))
+        self.register_buffer("additive_mask_fp16", boolean_to_additive_attention_mask(base_mask, torch.float16))
+        self.register_buffer("additive_mask_bf16", boolean_to_additive_attention_mask(base_mask, torch.bfloat16))
         self.engagement_head = EngagementHead(
             embed_dim=embed_dim,
             hidden_dim=embed_dim // 2,
@@ -430,12 +421,17 @@ class StudentEngagementTSHybridCLIP(nn.Module):
         e_task, e_box, e_patch = self.input_encoder(frames, boxes)
         sequence = self.spatiotemporal_injector(e_task, e_box, e_patch)
 
-        mask = (
-            self.hybrid_attention_mask
-            if t_frames == self.num_frames
-            else build_ts_hybrid_attention_mask(t_frames, self.num_patches, sequence.device)
-        )
-        encoded_sequence = self.transformer(sequence, mask)
+        if t_frames == self.num_frames:
+            if sequence.dtype == torch.bfloat16:
+                additive_mask = self.additive_mask_bf16
+            elif sequence.dtype == torch.float16:
+                additive_mask = self.additive_mask_fp16
+            else:
+                additive_mask = self.additive_mask_fp32
+        else:
+            dyn_mask = build_ts_hybrid_attention_mask(t_frames, self.num_patches, sequence.device)
+            additive_mask = boolean_to_additive_attention_mask(dyn_mask, dtype=sequence.dtype)
+        encoded_sequence = self.transformer(sequence, additive_mask)
         logits, probs = self.engagement_head(encoded_sequence)
         return {
             "logits": logits,

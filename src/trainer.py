@@ -1,12 +1,15 @@
 """
-Training & Evaluation Pipeline with Mixed Precision (AMP) for Google Colab T4 GPU.
-Strictly updates only LoRA (Q, V), Task Token, Coordinate MLP, Temporal Embeddings,
-and Engagement Head via Cross-Entropy Loss.
+Training & Evaluation Pipeline tối ưu hóa cho GPU NVIDIA A100:
+  - TF32 Tensor Cores (`allow_tf32 = True`, `float32_matmul_precision = 'high'`)
+  - Native BFloat16 (`torch.bfloat16`) autocast (không cần GradScaler, nhanh và ổn định hơn FP16)
+  - Fused AdamW (`fused=True` trên CUDA)
+  - Đo lường tốc độ huấn luyện (samples/sec)
 """
 
 from __future__ import annotations
 
 from pathlib import Path
+import time
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -16,16 +19,41 @@ from torch.utils.data import DataLoader
 from .model import StudentEngagementTSHybridCLIP
 
 
+def enable_a100_speedups() -> torch.dtype:
+    """
+    Kích hoạt các tối ưu hóa phần cứng cho GPU NVIDIA A100 (Ampere):
+      - TF32 cho MatMul và cuDNN
+      - Tự động chọn BFloat16 nếu GPU hỗ trợ (A100/H100), ngược lại dùng FP16 (T4/V100).
+    """
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+        if torch.cuda.is_bf16_supported():
+            return torch.bfloat16
+        return torch.float16
+    return torch.float32
+
+
+def resolve_amp_dtype(amp_mode: str = "auto") -> torch.dtype:
+    if not torch.cuda.is_available() or amp_mode == "fp32":
+        return torch.float32
+    if amp_mode == "bf16":
+        return torch.bfloat16
+    if amp_mode == "fp16":
+        return torch.float16
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
 def configure_optimizer(
     model: StudentEngagementTSHybridCLIP,
     lr_lora: float = 2e-4,
     lr_new_modules: float = 5e-4,
     weight_decay: float = 1e-2,
+    use_fused: bool = True,
 ) -> torch.optim.Optimizer:
-    """
-    Khởi tạo AdamW Optimizer chỉ cập nhật trọng số cho:
-    LoRA (Q, V), Task Token, Coordinate MLP, Temporal Embeddings và Engagement Head.
-    """
     groups = model.get_trainable_parameter_groups()
     optimizer_grouped_parameters = [
         {"params": groups["lora_qv"], "lr": lr_lora, "weight_decay": weight_decay},
@@ -34,7 +62,11 @@ def configure_optimizer(
         {"params": groups["coord_mlp"], "lr": lr_new_modules, "weight_decay": weight_decay},
         {"params": groups["engagement_head"], "lr": lr_new_modules, "weight_decay": weight_decay},
     ]
-    return torch.optim.AdamW(optimizer_grouped_parameters)
+    can_fuse = use_fused and torch.cuda.is_available()
+    try:
+        return torch.optim.AdamW(optimizer_grouped_parameters, fused=can_fuse)
+    except TypeError:
+        return torch.optim.AdamW(optimizer_grouped_parameters)
 
 
 def train_one_step(
@@ -43,24 +75,23 @@ def train_one_step(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    amp_dtype: torch.dtype = torch.bfloat16,
+    scaler: Optional[torch.amp.GradScaler] = None,
     max_grad_norm: float = 1.0,
 ) -> Tuple[float, torch.Tensor]:
-    """Một bước huấn luyện (hỗ trợ FP16 Mixed Precision trên GPU T4 để tiết kiệm VRAM)."""
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    frames = batch["frames"].to(device, non_blocking=True)  # (B, T, 3, 224, 224)
-    boxes = batch["boxes"].to(device, non_blocking=True)    # (B, T, 4)
-    labels = batch["label"].to(device, non_blocking=True)   # (B,)
+    frames = batch["frames"].to(device, non_blocking=True)
+    boxes = batch["boxes"].to(device, non_blocking=True)
+    labels = batch["label"].to(device, non_blocking=True)
 
-    use_amp = scaler is not None and device.type == "cuda"
-    with torch.cuda.amp.autocast(enabled=use_amp):
+    use_amp = (device.type == "cuda") and (amp_dtype in (torch.bfloat16, torch.float16))
+    with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
         outputs = model(frames=frames, boxes=boxes)
-        logits = outputs["logits"]
-        loss = criterion(logits, labels)
+        loss = criterion(outputs["logits"], labels)
 
-    if use_amp:
+    if scaler is not None and amp_dtype == torch.float16:
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(
@@ -84,14 +115,15 @@ def train_epoch(
     optimizer: torch.optim.Optimizer,
     criterion: nn.Module,
     device: torch.device,
-    scaler: Optional[torch.cuda.amp.GradScaler] = None,
+    amp_dtype: torch.dtype = torch.bfloat16,
+    scaler: Optional[torch.amp.GradScaler] = None,
     log_interval: int = 20,
 ) -> Dict[str, float]:
-    """Huấn luyện 1 epoch trên tập Train."""
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
+    t0 = time.perf_counter()
 
     for step, batch in enumerate(dataloader, start=1):
         loss_val, probs = train_one_step(
@@ -100,9 +132,10 @@ def train_epoch(
             optimizer=optimizer,
             criterion=criterion,
             device=device,
+            amp_dtype=amp_dtype,
             scaler=scaler,
         )
-        labels = batch["label"].to(device)
+        labels = batch["label"].to(device, non_blocking=True)
         preds = probs.argmax(dim=-1)
         batch_size = labels.size(0)
 
@@ -111,15 +144,20 @@ def train_epoch(
         total += batch_size
 
         if step % log_interval == 0 or step == len(dataloader):
+            elapsed = max(time.perf_counter() - t0, 1e-6)
+            throughput = total / elapsed
             print(
                 f"  [Step {step:4d}/{len(dataloader):4d}] "
                 f"Loss: {running_loss / max(total, 1):.4f} | "
-                f"Acc: {100.0 * correct / max(total, 1):.2f}%"
+                f"Acc: {100.0 * correct / max(total, 1):.2f}% | "
+                f"Speed: {throughput:.1f} samples/s"
             )
 
+    elapsed = max(time.perf_counter() - t0, 1e-6)
     return {
         "loss": running_loss / max(total, 1),
         "accuracy": 100.0 * correct / max(total, 1),
+        "samples_per_sec": total / elapsed,
     }
 
 
@@ -129,22 +167,22 @@ def evaluate(
     dataloader: DataLoader,
     criterion: nn.Module,
     device: torch.device,
+    amp_dtype: torch.dtype = torch.bfloat16,
 ) -> Dict[str, float]:
-    """Đánh giá mô hình trên tập Valid hoặc Test."""
     model.eval()
     running_loss = 0.0
     correct = 0
     total = 0
 
+    use_amp = (device.type == "cuda") and (amp_dtype in (torch.bfloat16, torch.float16))
     for batch in dataloader:
         frames = batch["frames"].to(device, non_blocking=True)
         boxes = batch["boxes"].to(device, non_blocking=True)
         labels = batch["label"].to(device, non_blocking=True)
 
-        with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+        with torch.amp.autocast(device_type=device.type, dtype=amp_dtype, enabled=use_amp):
             outputs = model(frames=frames, boxes=boxes)
-            logits = outputs["logits"]
-            loss = criterion(logits, labels)
+            loss = criterion(outputs["logits"], labels)
 
         preds = outputs["probs"].argmax(dim=-1)
         batch_size = labels.size(0)
@@ -164,14 +202,12 @@ def save_peft_checkpoint(
     epoch: int,
     metrics: Dict[str, Any],
 ) -> None:
-    """
-    Chỉ lưu các trọng số Trainable (LoRA Q/V, Task Token, Coordinate MLP,
-    P_temporal, Engagement Head) ra thư mục checkpoint riêng (không đụng tới thư mục dữ liệu).
-    """
     save_path.parent.mkdir(parents=True, exist_ok=True)
+    # Hỗ trợ cả model đã torch.compile() (_orig_mod)
+    raw_model = getattr(model, "_orig_mod", model)
     trainable_state = {
         k: v.cpu()
-        for k, v in model.state_dict().items()
+        for k, v in raw_model.state_dict().items()
         if any(
             token in k
             for token in (

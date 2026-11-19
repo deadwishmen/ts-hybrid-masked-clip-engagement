@@ -70,7 +70,7 @@ class ViMELDEngagementDataset(Dataset):
         split: str = "train",
         num_frames: int = 8,
         image_size: int = 224,
-        num_classes: int = 3,
+        num_classes: int = 4,
         manifest_path: Optional[Union[str, Path]] = None,
         default_video_width: int = 3200,
         default_video_height: int = 1800,
@@ -143,7 +143,17 @@ class ViMELDEngagementDataset(Dataset):
             if self.split in splits_data:
                 allowed_sessions = set(splits_data[self.split])
 
-        for behaviors_path in sorted(self.root_dir.rglob("behaviors.json")):
+        # Chỉ tìm behaviors.json ở cấp Session (<Date>/Period <P>/Angle <A>/<Session_ID>/behaviors.json)
+        # Tránh rglob() chui vào hàng trăm nghìn thư mục seg_* gây treo trên Google Drive FUSE
+        print(f"[Dataset] Đang quét cấu trúc session tại: {self.root_dir} ...", flush=True)
+        behavior_files = sorted(self.root_dir.glob("*/*/*/*/behaviors.json"))
+        if not behavior_files:
+            behavior_files = sorted(self.root_dir.glob("*/*/*/behaviors.json"))
+        if not behavior_files:
+            behavior_files = sorted(self.root_dir.rglob("behaviors.json"))
+        print(f"[Dataset] Tìm thấy {len(behavior_files)} file behaviors.json hợp lệ.", flush=True)
+
+        for behaviors_path in behavior_files:
             session_dir = behaviors_path.parent
             session_id = session_dir.name
             if allowed_sessions is not None and session_id not in allowed_sessions:
@@ -347,6 +357,8 @@ class ViMELDEngagementDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, index: int) -> Dict[str, Any]:
+        if cv2 is not None:
+            cv2.setNumThreads(0)
         sample = self.samples[index]
         boxes, video_frame_ids, sampled_pngs = self._load_boxes_and_frame_ids_from_segment(sample)
         frames = self._load_frames(sample, video_frame_ids, sampled_pngs)
